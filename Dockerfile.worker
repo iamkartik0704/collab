@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1.7
+# =============================================================================
+# Collab BullMQ worker: notifications (email + WhatsApp), invoices, refunds, RAG indexing,
+# analytics rollups, reservation expiry. Same source tree as the app, run with tsx.
+#   docker build -f Dockerfile.worker -t collab-worker .
+# =============================================================================
+ARG NODE_VERSION=22.20.0
+
+FROM node:${NODE_VERSION}-bookworm-slim AS base
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssl ca-certificates tini \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+
+# Full install only to generate the Prisma client (the CLI is a devDependency).
+FROM base AS generate
+COPY package.json package-lock.json ./
+COPY prisma/schema.prisma ./prisma/schema.prisma
+RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
+
+FROM base AS prod-deps
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+
+FROM base AS runner
+ARG APP_VERSION=dev
+ENV NODE_ENV=production APP_VERSION=${APP_VERSION}
+RUN groupadd --system --gid 1001 collab && useradd --system --uid 1001 --gid collab --create-home collab
+COPY --from=prod-deps --chown=collab:collab /app/node_modules ./node_modules
+COPY --from=generate --chown=collab:collab /app/node_modules/.prisma ./node_modules/.prisma
+COPY --chown=collab:collab package.json tsconfig.json tsconfig.worker.json ./
+COPY --chown=collab:collab prisma/schema.prisma ./prisma/schema.prisma
+COPY --chown=collab:collab src ./src
+# One-off maintenance, e.g. `exec worker node_modules/.bin/tsx --tsconfig tsconfig.worker.json scripts/ai-reindex.ts`
+COPY --chown=collab:collab scripts/ai-reindex.ts ./scripts/ai-reindex.ts
+USER collab
+STOPSIGNAL SIGTERM
+# tini forwards SIGTERM so in-flight jobs finish (graceful shutdown in src/workers/index.ts).
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["node_modules/.bin/tsx", "--tsconfig", "tsconfig.worker.json", "src/workers/index.ts"]

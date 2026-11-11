@@ -1,0 +1,94 @@
+# Local development dependencies: PostgreSQL 16 + pgvector, PgBouncer (transaction mode), Redis 7.
+#   docker compose up -d
+#   DATABASE_URL=postgresql://collab:collab@localhost:6432/collab?pgbouncer=true
+#   DIRECT_DATABASE_URL=postgresql://collab:collab@localhost:5432/collab
+#   REDIS_URL=redis://localhost:6379/0
+#   S3_ENDPOINT=http://localhost:9000  S3_FORCE_PATH_STYLE=true  S3_REGION=us-east-1
+#   S3_BUCKET=collab-assets  S3_ACCESS_KEY_ID=collab  S3_SECRET_ACCESS_KEY=collab-minio-secret
+#   S3_PUBLIC_BASE_URL=http://localhost:9000/collab-assets      (MinIO console: http://localhost:9001)
+# Production orchestration lives in docker-compose.prod.yml (Phase 6).
+name: collab-dev
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: collab
+      POSTGRES_PASSWORD: collab
+      POSTGRES_DB: collab
+    ports: ["5432:5432"]
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U collab -d collab"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: collab
+      DB_PASSWORD: collab
+      DB_NAME: collab
+      POOL_MODE: transaction
+      AUTH_TYPE: scram-sha-256
+      MAX_CLIENT_CONN: "500"
+      DEFAULT_POOL_SIZE: "20"
+    ports: ["6432:5432"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction"]
+    ports: ["6379:6379"]
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # S3-compatible object storage (stands in for S3 / R2 in development).
+  # MinIO stopped publishing community images; pgsty/silo is the actively patched community
+  # successor of pgsty/minio (same S3 API, data format and MINIO_* settings; binary is `silo`,
+  # and it ships the `mc` client used by minio-init). Pinned to a release for reproducibility.
+  minio:
+    image: pgsty/silo:RELEASE.2026-11-09T00-00-00Z
+    command: ["silo", "server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: collab
+      MINIO_ROOT_PASSWORD: collab-minio-secret
+      # Browser uploads use presigned POSTs from the app origin.
+      MINIO_API_CORS_ALLOW_ORIGIN: "http://localhost:3000"
+    ports: ["9000:9000", "9001:9001"]
+    volumes: [minio-data:/data]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: creates the bucket and makes product images publicly readable (the CDN role).
+  minio-init:
+    image: pgsty/silo:RELEASE.2026-11-09T00-00-00Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        mc alias set local http://minio:9000 collab collab-minio-secret &&
+        mc mb --ignore-existing local/collab-assets &&
+        mc anonymous set download local/collab-assets/products &&
+        echo "bucket collab-assets ready"
+    restart: "no"
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:

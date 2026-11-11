@@ -1,0 +1,1326 @@
+// =============================================================================
+// Collab - PostgreSQL 16 data model
+//
+// Conventions
+// - Money is stored as INTEGER minor units (paise / cents) in `*Minor` columns.
+//   Never use floats for money; the server computes every price from these columns.
+// - Percentages are basis points (`*Bps`, 1800 = 18.00%).
+// - All timestamps are timestamptz(3).
+// - `vector(1024)` columns are written and read with $queryRaw / $executeRaw
+//   (Prisma does not map pgvector). The dimension must equal AI_EMBEDDING_DIMENSIONS.
+// - Constraints Prisma cannot express (CHECKs, HNSW vector indexes, the append-only
+//   trigger on AdminAuditLog/StockMovementLog) live in the SQL of the first migration.
+// =============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+  // native = the dev machine; debian-openssl-3.0.x = the node:22-bookworm-slim images (Dockerfile*).
+  binaryTargets   = ["native", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  // Pooled connection through PgBouncer (transaction mode) - used at runtime.
+  url        = env("DATABASE_URL")
+  // Direct connection - used by `prisma migrate` (DDL is not PgBouncer-safe).
+  directUrl  = env("DIRECT_DATABASE_URL")
+  extensions = [vector, pg_trgm]
+}
+
+// -----------------------------------------------------------------------------
+// Enums
+// -----------------------------------------------------------------------------
+
+enum Role {
+  CUSTOMER
+  SUPPORT_AGENT
+  INVENTORY_MANAGER
+  SUPER_ADMIN
+}
+
+enum Currency {
+  INR
+  USD
+}
+
+enum OtpChannel {
+  EMAIL
+  WHATSAPP
+}
+
+enum OtpPurpose {
+  LOGIN
+  VERIFY_EMAIL
+  VERIFY_PHONE
+}
+
+enum AddressType {
+  HOME
+  OFFICE
+  OTHER
+}
+
+enum ProductStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+enum StockMovementType {
+  RESTOCK
+  RESERVATION
+  RESERVATION_RELEASE
+  SALE
+  CUSTOMER_RETURN
+  MANUAL_ADJUSTMENT
+  DAMAGE
+  CSV_IMPORT
+  ORDER_CANCELLATION
+}
+
+enum StockAdjustmentReason {
+  PURCHASE_ORDER_RECEIVED
+  CYCLE_COUNT_CORRECTION
+  DAMAGED
+  LOST_OR_STOLEN
+  RETURN_TO_VENDOR
+  CUSTOMER_RETURN_RESTOCK
+  SYSTEM_CORRECTION
+}
+
+enum ReservationStatus {
+  ACTIVE
+  CONSUMED
+  EXPIRED
+  RELEASED
+}
+
+enum OrderStatus {
+  PENDING_PAYMENT
+  PLACED
+  CONFIRMED
+  PACKED
+  SHIPPED
+  OUT_FOR_DELIVERY
+  DELIVERED
+  CANCELLED
+  PAYMENT_FAILED
+  RETURNED
+}
+
+enum ShippingSpeed {
+  STANDARD
+  EXPRESS
+  SCHEDULED
+}
+
+enum PaymentProvider {
+  STRIPE
+  RAZORPAY
+}
+
+enum PaymentMethodType {
+  CARD
+  UPI
+  NETBANKING
+  WALLET
+}
+
+enum PaymentStatus {
+  CREATED
+  PENDING
+  AUTHORIZED
+  SUCCEEDED
+  FAILED
+  CANCELLED
+  PARTIALLY_REFUNDED
+  REFUNDED
+}
+
+enum RefundStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+enum DiscountType {
+  PERCENTAGE
+  FLAT
+}
+
+enum ReviewStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum ReturnType {
+  RETURN
+  REPLACEMENT
+  WARRANTY_REPAIR
+}
+
+enum ReturnStatus {
+  REQUESTED
+  APPROVED
+  REJECTED
+  PICKUP_SCHEDULED
+  RECEIVED
+  REFUNDED
+  CLOSED
+}
+
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  WAITING_ON_CUSTOMER
+  RESOLVED
+  CLOSED
+}
+
+enum TicketPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+enum TicketCategory {
+  ORDER
+  RETURN
+  WARRANTY
+  PAYMENT
+  PRODUCT
+  OTHER
+}
+
+enum ChatSessionStatus {
+  ACTIVE
+  ESCALATED
+  HUMAN_TAKEOVER
+  CLOSED
+}
+
+enum ChatRole {
+  USER
+  ASSISTANT
+  TOOL
+  HUMAN_AGENT
+  SYSTEM
+}
+
+enum KnowledgeSourceType {
+  PRODUCT
+  FAQ
+  WARRANTY_POLICY
+  SHIPPING_POLICY
+  RETURN_POLICY
+}
+
+enum NotificationChannel {
+  WHATSAPP
+  EMAIL
+}
+
+enum NotificationType {
+  OTP
+  ORDER_CONFIRMATION
+  ORDER_SHIPPED
+  OUT_FOR_DELIVERY
+  ORDER_DELIVERED
+  ABANDONED_CART
+  LOW_STOCK_ALERT
+  REFUND_ISSUED
+  SUPPORT_ESCALATION
+}
+
+enum NotificationStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  READ
+  FAILED
+  DEAD_LETTERED
+}
+
+enum WebhookSource {
+  STRIPE
+  RAZORPAY
+  WHATSAPP
+}
+
+enum WebhookProcessingStatus {
+  PROCESSING
+  PROCESSED
+  FAILED
+}
+
+enum AdminAuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  PRICE_CHANGE
+  STOCK_ADJUSTMENT
+  ORDER_STATUS_CHANGE
+  REFUND
+  ROLE_CHANGE
+  COUPON_CHANGE
+  CHAT_TAKEOVER
+  BULK_IMPORT
+}
+
+enum AdminAlertType {
+  LOW_STOCK
+  OUT_OF_STOCK
+  SUPPORT_ESCALATION
+  PAYMENT_ANOMALY
+  WEBHOOK_FAILURE
+  NOTIFICATION_DEAD_LETTER
+}
+
+enum AlertSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+// -----------------------------------------------------------------------------
+// Identity, auth & RBAC
+// -----------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  /// Lower-cased on write. Nullable: WhatsApp-OTP users may have no email.
+  email         String?   @unique @db.VarChar(320)
+  emailVerified DateTime? @db.Timestamptz(3)
+  /// E.164 format (+919876543210).
+  phone         String?   @unique @db.VarChar(16)
+  phoneVerified DateTime? @db.Timestamptz(3)
+  name          String?   @db.VarChar(120)
+  image         String?
+  role          Role      @default(CUSTOMER)
+  isActive      Boolean   @default(true)
+  lastLoginAt   DateTime? @db.Timestamptz(3)
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime  @updatedAt @db.Timestamptz(3)
+
+  accounts               Account[]
+  sessions               Session[]
+  refreshTokens          RefreshToken[]
+  addresses              Address[]
+  cart                   Cart?
+  wishlistItems          WishlistItem[]
+  orders                 Order[]
+  reviews                Review[]
+  returnRequests         ReturnRequest[]
+  supportTickets         SupportTicket[]         @relation("TicketCustomer")
+  assignedTickets        SupportTicket[]         @relation("TicketAssignee")
+  chatSessions           ChatSession[]           @relation("ChatCustomer")
+  takenOverChats         ChatSession[]           @relation("ChatAgent")
+  agentChatMessages      ChatMessage[]
+  notificationPreference NotificationPreference?
+  notificationLogs       NotificationLog[]
+  couponRedemptions      CouponRedemption[]
+  createdCoupons         Coupon[]
+  stockMovements         StockMovementLog[]
+  orderStatusChanges     OrderStatusHistory[]
+  refundsInitiated       Refund[]
+  auditLogs              AdminAuditLog[]
+  acknowledgedAlerts     AdminAlert[]
+
+  @@index([role])
+  @@index([createdAt])
+}
+
+/// Auth.js OAuth account link (Google).
+model Account {
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?  @db.Text
+  access_token      String?  @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?  @db.Text
+  session_state     String?
+  createdAt         DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime @updatedAt @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([provider, providerAccountId])
+  @@index([userId])
+}
+
+/// Present for Auth.js adapter compatibility. Collab uses the JWT session strategy.
+model Session {
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime @db.Timestamptz(3)
+  createdAt    DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String
+  expires    DateTime @db.Timestamptz(3)
+
+  @@id([identifier, token])
+}
+
+/// Rotating refresh tokens. Only an HMAC-SHA256 hash is stored. Presenting a token that
+/// was already rotated (replacedById set) revokes the whole family (reuse detection).
+model RefreshToken {
+  id            String    @id @default(cuid())
+  userId        String
+  tokenHash     String    @unique @db.Char(64)
+  familyId      String
+  replacedById  String?   @unique
+  expiresAt     DateTime  @db.Timestamptz(3)
+  revokedAt     DateTime? @db.Timestamptz(3)
+  revokedReason String?   @db.VarChar(64)
+  ipHash        String?   @db.Char(64)
+  userAgent     String?   @db.VarChar(512)
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
+
+  user       User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  replacedBy RefreshToken? @relation("TokenRotation", fields: [replacedById], references: [id], onDelete: SetNull)
+  replaces   RefreshToken? @relation("TokenRotation")
+
+  @@index([userId])
+  @@index([familyId])
+  @@index([expiresAt])
+}
+
+/// One-time passcodes for email / WhatsApp login. The code is stored as an HMAC hash.
+model OtpCode {
+  id          String     @id @default(cuid())
+  channel     OtpChannel
+  /// Normalised email or E.164 phone.
+  target      String     @db.VarChar(320)
+  purpose     OtpPurpose
+  codeHash    String     @db.Char(64)
+  attempts    Int        @default(0)
+  maxAttempts Int        @default(5)
+  expiresAt   DateTime   @db.Timestamptz(3)
+  consumedAt  DateTime?  @db.Timestamptz(3)
+  ipHash      String?    @db.Char(64)
+  createdAt   DateTime   @default(now()) @db.Timestamptz(3)
+
+  @@index([target, purpose, createdAt])
+  @@index([expiresAt])
+}
+
+model Address {
+  id          String      @id @default(cuid())
+  userId      String
+  type        AddressType @default(HOME)
+  label       String?     @db.VarChar(40)
+  fullName    String      @db.VarChar(120)
+  phone       String      @db.VarChar(16)
+  line1       String      @db.VarChar(200)
+  line2       String?     @db.VarChar(200)
+  landmark    String?     @db.VarChar(120)
+  city        String      @db.VarChar(80)
+  state       String      @db.VarChar(80)
+  postalCode  String      @db.VarChar(12)
+  /// ISO 3166-1 alpha-2.
+  countryCode String      @default("IN") @db.Char(2)
+  isDefault   Boolean     @default(false)
+  createdAt   DateTime    @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime    @updatedAt @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model NotificationPreference {
+  userId                String    @id
+  /// WhatsApp Business policy requires explicit opt-in.
+  whatsappOptIn         Boolean   @default(false)
+  whatsappOptInAt       DateTime? @db.Timestamptz(3)
+  /// Set when the customer replies STOP on WhatsApp; suppresses marketing (e.g. cart reminders).
+  whatsappOptOutAt      DateTime? @db.Timestamptz(3)
+  whatsappMarketing     Boolean   @default(false)
+  emailOrderUpdates     Boolean   @default(true)
+  emailMarketing        Boolean   @default(false)
+  abandonedCartReminder Boolean   @default(true)
+  updatedAt             DateTime  @updatedAt @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// -----------------------------------------------------------------------------
+// Catalog
+// -----------------------------------------------------------------------------
+
+model Category {
+  id           String   @id @default(cuid())
+  slug         String   @unique @db.VarChar(80)
+  name         String   @db.VarChar(80)
+  description  String?  @db.Text
+  /// lucide-react icon name used by the category strip / carousel.
+  iconKey      String?  @db.VarChar(60)
+  imageUrl     String?
+  parentId     String?
+  sortOrder    Int      @default(0)
+  isActive     Boolean  @default(true)
+  /// GST / sales tax rate in basis points applied to products in this category.
+  taxRateBps   Int      @default(1800)
+  /// India GST HSN code printed on tax invoices.
+  hsnCode      String?  @db.VarChar(10)
+  /// Technical-spec template: groups, keys, units and which keys are filterable facets.
+  specTemplate Json?
+  createdAt    DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @db.Timestamptz(3)
+
+  parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children Category[] @relation("CategoryTree")
+  products Product[]
+  coupons  Coupon[]   @relation("CouponCategories")
+
+  @@index([parentId, sortOrder])
+}
+
+model Brand {
+  id        String   @id @default(cuid())
+  slug      String   @unique @db.VarChar(80)
+  name      String   @db.VarChar(80)
+  logoUrl   String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  products Product[]
+  coupons  Coupon[]  @relation("CouponBrands")
+}
+
+model Product {
+  id                 String                       @id @default(cuid())
+  slug               String                       @unique @db.VarChar(160)
+  name               String                       @db.VarChar(200)
+  subtitle           String?                      @db.VarChar(200)
+  summary            String?                      @db.Text
+  description        String                       @db.Text
+  brandId            String
+  categoryId         String
+  status             ProductStatus                @default(DRAFT)
+  /// GST overrides; null = use the category's HSN code / rate (Category.taxRateBps, 1800 = 18%).
+  hsnCode            String?                      @db.VarChar(10)
+  gstRateBps         Int?
+  /// Full grouped technical specification, e.g. { "Display": { "Screen size": "6.7\"" } }.
+  specs              Json                         @default("{}")
+  /// The six headline hardware cards on the product page.
+  highlightSpecs     Json                         @default("[]")
+  isFeatured         Boolean                      @default(false)
+  warrantyMonths     Int                          @default(12)
+  /// Denormalised by the analytics worker; drives the "Bestseller" tab.
+  salesCount         Int                          @default(0)
+  ratingAverage      Float                        @default(0)
+  ratingCount        Int                          @default(0)
+  metaTitle          String?                      @db.VarChar(70)
+  metaDescription    String?                      @db.VarChar(170)
+  embedding          Unsupported("vector(1024)")?
+  embeddingUpdatedAt DateTime?                    @db.Timestamptz(3)
+  publishedAt        DateTime?                    @db.Timestamptz(3)
+  createdAt          DateTime                     @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime                     @updatedAt @db.Timestamptz(3)
+  deletedAt          DateTime?                    @db.Timestamptz(3)
+
+  brand           Brand            @relation(fields: [brandId], references: [id], onDelete: Restrict)
+  category        Category         @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  variants        ProductVariant[]
+  images          ProductImage[]
+  reviews         Review[]
+  wishlistItems   WishlistItem[]
+  orderItems      OrderItem[]
+  knowledgeChunks KnowledgeChunk[]
+
+  @@index([categoryId, status])
+  @@index([brandId, status])
+  @@index([status, publishedAt])
+  @@index([status, salesCount])
+  @@index([isFeatured, status])
+  @@index([specs(ops: JsonbPathOps)], type: Gin)
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "Product_name_trgm_idx")
+}
+
+model ProductImage {
+  id         String   @id @default(cuid())
+  productId  String
+  /// Colour-specific images for the gallery when a swatch is selected.
+  variantId  String?
+  /// Object-storage key; the public URL is derived from S3_PUBLIC_BASE_URL.
+  storageKey String   @db.VarChar(512)
+  alt        String   @db.VarChar(200)
+  width      Int
+  height     Int
+  sortOrder  Int      @default(0)
+  isPrimary  Boolean  @default(false)
+  createdAt  DateTime @default(now()) @db.Timestamptz(3)
+
+  product Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variant ProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+
+  @@index([productId, sortOrder])
+  @@index([variantId])
+}
+
+model ProductVariant {
+  id                  String    @id @default(cuid())
+  productId           String
+  sku                 String    @unique @db.VarChar(64)
+  barcode             String?   @unique @db.VarChar(32)
+  /// e.g. "Deep Purple / 256GB / 8GB".
+  title               String    @db.VarChar(200)
+  color               String?   @db.VarChar(40)
+  colorHex            String?   @db.Char(7)
+  storageGb           Int?
+  ramGb               Int?
+  /// Any additional selectable options for future categories.
+  options             Json      @default("{}")
+  priceMinor          Int
+  compareAtPriceMinor Int?
+  costPriceMinor      Int?
+  currency            Currency  @default(INR)
+  weightGrams         Int?
+  isDefault           Boolean   @default(false)
+  isActive            Boolean   @default(true)
+  createdAt           DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt           DateTime  @updatedAt @db.Timestamptz(3)
+  deletedAt           DateTime? @db.Timestamptz(3)
+
+  product       Product            @relation(fields: [productId], references: [id], onDelete: Cascade)
+  inventory     InventoryItem?
+  images        ProductImage[]
+  cartItems     CartItem[]
+  orderItems    OrderItem[]
+  reservations  StockReservation[]
+  movements     StockMovementLog[]
+  wishlistItems WishlistItem[]
+
+  @@index([productId, isActive])
+  @@index([priceMinor])
+  @@index([storageGb])
+  @@index([ramGb])
+  @@index([color])
+}
+
+// -----------------------------------------------------------------------------
+// Inventory engine
+// -----------------------------------------------------------------------------
+
+/// Invariant (CHECK in migration): quantityAvailable = quantityOnHand - quantityReserved,
+/// and all three are >= 0. Rows are mutated only inside SELECT ... FOR UPDATE transactions.
+model InventoryItem {
+  id                String    @id @default(cuid())
+  variantId         String    @unique
+  quantityOnHand    Int       @default(0)
+  quantityReserved  Int       @default(0)
+  quantityAvailable Int       @default(0)
+  lowStockThreshold Int       @default(5)
+  warehouseLocation String    @default("MAIN") @db.VarChar(60)
+  /// Prevents repeat low-stock alerts until the item is restocked above threshold.
+  lowStockAlertedAt DateTime? @db.Timestamptz(3)
+  /// Optimistic-concurrency version for admin edits.
+  version           Int       @default(0)
+  createdAt         DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime  @updatedAt @db.Timestamptz(3)
+
+  variant      ProductVariant     @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  reservations StockReservation[]
+  movements    StockMovementLog[]
+
+  @@index([quantityAvailable])
+}
+
+/// Units held for a PENDING_PAYMENT order. A delayed BullMQ job releases ACTIVE rows at expiresAt.
+model StockReservation {
+  id              String            @id @default(cuid())
+  orderId         String
+  variantId       String
+  inventoryItemId String
+  quantity        Int
+  status          ReservationStatus @default(ACTIVE)
+  expiresAt       DateTime          @db.Timestamptz(3)
+  consumedAt      DateTime?         @db.Timestamptz(3)
+  releasedAt      DateTime?         @db.Timestamptz(3)
+  releaseReason   String?           @db.VarChar(64)
+  /// BullMQ job id of the `release-expired-reservation` job.
+  releaseJobId    String?           @db.VarChar(128)
+  createdAt       DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime          @updatedAt @db.Timestamptz(3)
+
+  order         Order              @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  variant       ProductVariant     @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  inventoryItem InventoryItem      @relation(fields: [inventoryItemId], references: [id], onDelete: Restrict)
+  movements     StockMovementLog[]
+
+  @@unique([orderId, variantId])
+  @@index([status, expiresAt])
+  @@index([variantId, status])
+}
+
+/// Append-only audit trail of every inventory change (UPDATE/DELETE blocked by trigger).
+model StockMovementLog {
+  id              String                 @id @default(cuid())
+  variantId       String
+  inventoryItemId String
+  type            StockMovementType
+  reason          StockAdjustmentReason?
+  note            String?                @db.VarChar(500)
+  onHandDelta     Int
+  reservedDelta   Int
+  onHandAfter     Int
+  reservedAfter   Int
+  availableAfter  Int
+  orderId         String?
+  reservationId   String?
+  actorId         String?
+  createdAt       DateTime               @default(now()) @db.Timestamptz(3)
+
+  variant       ProductVariant    @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  inventoryItem InventoryItem     @relation(fields: [inventoryItemId], references: [id], onDelete: Restrict)
+  order         Order?            @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  reservation   StockReservation? @relation(fields: [reservationId], references: [id], onDelete: SetNull)
+  actor         User?             @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([variantId, createdAt])
+  @@index([orderId])
+  @@index([type, createdAt])
+}
+
+// -----------------------------------------------------------------------------
+// Cart & wishlist
+// -----------------------------------------------------------------------------
+
+/// One cart per signed-in user, or one per guest token. Items hold no prices:
+/// every amount is recomputed server-side from ProductVariant.
+model Cart {
+  id                      String    @id @default(cuid())
+  userId                  String?   @unique
+  /// Random token in an HttpOnly cookie for guests; the cart merges into the user's on login.
+  guestToken              String?   @unique @db.VarChar(64)
+  couponCode              String?   @db.VarChar(40)
+  currency                Currency  @default(INR)
+  lastActivityAt          DateTime  @default(now()) @db.Timestamptz(3)
+  abandonedReminderSentAt DateTime? @db.Timestamptz(3)
+  createdAt               DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt               DateTime  @updatedAt @db.Timestamptz(3)
+
+  user  User?      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items CartItem[]
+
+  @@index([lastActivityAt])
+}
+
+model CartItem {
+  id        String   @id @default(cuid())
+  cartId    String
+  variantId String
+  quantity  Int
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  cart    Cart           @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  variant ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@unique([cartId, variantId])
+}
+
+model WishlistItem {
+  id        String   @id @default(cuid())
+  userId    String
+  productId String
+  variantId String?
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  user    User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  product Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variant ProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+
+  @@unique([userId, productId])
+}
+
+// -----------------------------------------------------------------------------
+// Orders, shipping & payments
+// -----------------------------------------------------------------------------
+
+model ShippingMethod {
+  id             String        @id @default(cuid())
+  code           String        @unique @db.VarChar(40)
+  name           String        @db.VarChar(80)
+  description    String?       @db.VarChar(200)
+  speed          ShippingSpeed
+  priceMinor     Int
+  /// Free when the post-discount subtotal reaches this amount.
+  freeAboveMinor Int?
+  minDays        Int
+  maxDays        Int
+  /// Scheduled delivery: customer picks a date + slot.
+  requiresSlot   Boolean       @default(false)
+  isActive       Boolean       @default(true)
+  sortOrder      Int           @default(0)
+  createdAt      DateTime      @default(now()) @db.Timestamptz(3)
+  updatedAt      DateTime      @updatedAt @db.Timestamptz(3)
+
+  orders Order[]
+}
+
+model Order {
+  id                    String      @id @default(cuid())
+  /// Human-readable, e.g. CLB-260001234.
+  orderNumber           String      @unique @db.VarChar(24)
+  userId                String
+  status                OrderStatus @default(PENDING_PAYMENT)
+  currency              Currency    @default(INR)
+  subtotalMinor         Int
+  discountMinor         Int         @default(0)
+  giftCardMinor         Int         @default(0)
+  taxMinor              Int
+  shippingMinor         Int
+  totalMinor            Int
+  couponId              String?
+  couponCode            String?     @db.VarChar(40)
+  /// Address snapshot at purchase time (survives address edits/deletes).
+  shippingAddress       Json
+  billingAddress        Json?
+  shippingMethodId      String
+  shippingMethodName    String      @db.VarChar(80)
+  scheduledDeliveryDate DateTime?   @db.Date
+  scheduledSlot         String?     @db.VarChar(40)
+  estimatedDeliveryAt   DateTime?   @db.Timestamptz(3)
+  carrierName           String?     @db.VarChar(80)
+  trackingNumber        String?     @db.VarChar(64)
+  trackingUrl           String?
+  invoiceNumber         String?     @unique @db.VarChar(32)
+  invoiceStorageKey     String?     @db.VarChar(512)
+  invoiceGeneratedAt    DateTime?   @db.Timestamptz(3)
+  /// B2B buyers: GSTIN printed on the tax invoice (enables input tax credit).
+  customerGstin         String?     @db.VarChar(15)
+  customerNote          String?     @db.VarChar(500)
+  cancelReason          String?     @db.VarChar(200)
+  /// Mirrors the Redis idempotency record; guarantees one order per checkout attempt.
+  idempotencyKey        String      @unique @db.VarChar(128)
+  placedAt              DateTime?   @db.Timestamptz(3)
+  confirmedAt           DateTime?   @db.Timestamptz(3)
+  packedAt              DateTime?   @db.Timestamptz(3)
+  shippedAt             DateTime?   @db.Timestamptz(3)
+  outForDeliveryAt      DateTime?   @db.Timestamptz(3)
+  deliveredAt           DateTime?   @db.Timestamptz(3)
+  cancelledAt           DateTime?   @db.Timestamptz(3)
+  createdAt             DateTime    @default(now()) @db.Timestamptz(3)
+  updatedAt             DateTime    @updatedAt @db.Timestamptz(3)
+
+  user                 User                  @relation(fields: [userId], references: [id], onDelete: Restrict)
+  coupon               Coupon?               @relation(fields: [couponId], references: [id], onDelete: SetNull)
+  shippingMethod       ShippingMethod        @relation(fields: [shippingMethodId], references: [id], onDelete: Restrict)
+  items                OrderItem[]
+  statusHistory        OrderStatusHistory[]
+  payments             Payment[]
+  refunds              Refund[]
+  reservations         StockReservation[]
+  stockMovements       StockMovementLog[]
+  couponRedemption     CouponRedemption?
+  giftCardTransactions GiftCardTransaction[]
+  returnRequests       ReturnRequest[]
+  creditNotes          CreditNote[]
+  supportTickets       SupportTicket[]
+  notificationLogs     NotificationLog[]
+
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+  @@index([createdAt])
+}
+
+model OrderItem {
+  id                  String   @id @default(cuid())
+  orderId             String
+  productId           String
+  variantId           String
+  // Snapshots - immutable after purchase.
+  productName         String   @db.VarChar(200)
+  variantTitle        String   @db.VarChar(200)
+  sku                 String   @db.VarChar(64)
+  imageKey            String?  @db.VarChar(512)
+  hsnCode             String?  @db.VarChar(10)
+  unitPriceMinor      Int
+  compareAtPriceMinor Int?
+  quantity            Int
+  discountMinor       Int      @default(0)
+  taxRateBps          Int
+  taxMinor            Int
+  lineTotalMinor      Int
+  refundedQuantity    Int      @default(0)
+  /// Device serial / IMEI numbers recorded at packing (one per unit), printed on the invoice.
+  serialNumbers       String[] @default([])
+  createdAt           DateTime @default(now()) @db.Timestamptz(3)
+
+  order          Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product        Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
+  variant        ProductVariant  @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  review         Review?
+  returnRequests ReturnRequest[]
+
+  @@index([orderId])
+  @@index([variantId])
+}
+
+model OrderStatusHistory {
+  id         String       @id @default(cuid())
+  orderId    String
+  fromStatus OrderStatus?
+  toStatus   OrderStatus
+  note       String?      @db.VarChar(500)
+  actorId    String?
+  createdAt  DateTime     @default(now()) @db.Timestamptz(3)
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([orderId, createdAt])
+}
+
+model Payment {
+  id                  String             @id @default(cuid())
+  orderId             String
+  provider            PaymentProvider
+  method              PaymentMethodType?
+  status              PaymentStatus      @default(CREATED)
+  /// Stripe PaymentIntent id / Razorpay order id.
+  providerOrderId     String?            @db.VarChar(128)
+  /// Stripe charge id / Razorpay payment id.
+  providerPaymentId   String?            @db.VarChar(128)
+  amountMinor         Int
+  amountRefundedMinor Int                @default(0)
+  currency            Currency
+  idempotencyKey      String             @unique @db.VarChar(128)
+  failureCode         String?            @db.VarChar(64)
+  failureMessage      String?            @db.VarChar(500)
+  capturedAt          DateTime?          @db.Timestamptz(3)
+  createdAt           DateTime           @default(now()) @db.Timestamptz(3)
+  updatedAt           DateTime           @updatedAt @db.Timestamptz(3)
+
+  order   Order    @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  refunds Refund[]
+
+  @@unique([provider, providerOrderId])
+  @@unique([provider, providerPaymentId])
+  @@index([orderId])
+  @@index([status, createdAt])
+}
+
+model Refund {
+  id               String          @id @default(cuid())
+  paymentId        String
+  orderId          String
+  provider         PaymentProvider
+  providerRefundId String?         @db.VarChar(128)
+  amountMinor      Int
+  status           RefundStatus    @default(PENDING)
+  reason           String          @db.VarChar(500)
+  idempotencyKey   String          @unique @db.VarChar(128)
+  initiatedById    String?
+  processedAt      DateTime?       @db.Timestamptz(3)
+  createdAt        DateTime        @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime        @updatedAt @db.Timestamptz(3)
+
+  payment       Payment        @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  order         Order          @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  initiatedBy   User?          @relation(fields: [initiatedById], references: [id], onDelete: SetNull)
+  returnRequest ReturnRequest?
+  creditNote    CreditNote?
+
+  @@unique([provider, providerRefundId])
+  @@index([orderId])
+}
+
+// -----------------------------------------------------------------------------
+// Promotions & stored value
+// -----------------------------------------------------------------------------
+
+model Coupon {
+  id                String       @id @default(cuid())
+  /// Stored upper-case.
+  code              String       @unique @db.VarChar(40)
+  description       String?      @db.VarChar(200)
+  discountType      DiscountType
+  /// PERCENTAGE coupons.
+  percentOffBps     Int?
+  /// Upper bound for a PERCENTAGE discount.
+  maxDiscountMinor  Int?
+  /// FLAT coupons.
+  amountOffMinor    Int?
+  minCartValueMinor Int          @default(0)
+  usageLimitTotal   Int?
+  usageLimitPerUser Int?
+  timesRedeemed     Int          @default(0)
+  firstOrderOnly    Boolean      @default(false)
+  startsAt          DateTime     @default(now()) @db.Timestamptz(3)
+  expiresAt         DateTime?    @db.Timestamptz(3)
+  isActive          Boolean      @default(true)
+  createdById       String?
+  createdAt         DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime     @updatedAt @db.Timestamptz(3)
+
+  /// Empty = applies to all categories / brands.
+  categories  Category[]         @relation("CouponCategories")
+  brands      Brand[]            @relation("CouponBrands")
+  createdBy   User?              @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  redemptions CouponRedemption[]
+  orders      Order[]
+
+  @@index([isActive, expiresAt])
+}
+
+model CouponRedemption {
+  id            String   @id @default(cuid())
+  couponId      String
+  userId        String
+  orderId       String   @unique
+  discountMinor Int
+  createdAt     DateTime @default(now()) @db.Timestamptz(3)
+
+  coupon Coupon @relation(fields: [couponId], references: [id], onDelete: Restrict)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+  order  Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([couponId, userId])
+}
+
+/// Loyalty / bonus card (stored value). The card code is a bearer secret: only its
+/// HMAC hash and last four characters are stored.
+model GiftCard {
+  id                  String    @id @default(cuid())
+  codeHash            String    @unique @db.Char(64)
+  last4               String    @db.Char(4)
+  initialBalanceMinor Int
+  balanceMinor        Int
+  currency            Currency  @default(INR)
+  expiresAt           DateTime? @db.Timestamptz(3)
+  isActive            Boolean   @default(true)
+  createdAt           DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt           DateTime  @updatedAt @db.Timestamptz(3)
+
+  transactions GiftCardTransaction[]
+}
+
+model GiftCardTransaction {
+  id                String   @id @default(cuid())
+  giftCardId        String
+  orderId           String?
+  /// Negative = redemption, positive = top-up / refund.
+  amountMinor       Int
+  balanceAfterMinor Int
+  createdAt         DateTime @default(now()) @db.Timestamptz(3)
+
+  giftCard GiftCard @relation(fields: [giftCardId], references: [id], onDelete: Restrict)
+  order    Order?   @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  @@index([giftCardId, createdAt])
+}
+
+// -----------------------------------------------------------------------------
+// Reviews, returns & warranty
+// -----------------------------------------------------------------------------
+
+model Review {
+  id                 String       @id @default(cuid())
+  productId          String
+  userId             String
+  /// Set when the review is tied to a delivered purchase ("Verified purchase").
+  orderItemId        String?      @unique
+  /// 1..5 (CHECK in migration).
+  rating             Int
+  title              String       @db.VarChar(120)
+  body               String       @db.Text
+  isVerifiedPurchase Boolean      @default(false)
+  status             ReviewStatus @default(PENDING)
+  helpfulCount       Int          @default(0)
+  createdAt          DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime     @updatedAt @db.Timestamptz(3)
+
+  product   Product    @relation(fields: [productId], references: [id], onDelete: Cascade)
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  orderItem OrderItem? @relation(fields: [orderItemId], references: [id], onDelete: SetNull)
+
+  @@unique([productId, userId])
+  @@index([productId, status, createdAt])
+}
+
+model ReturnRequest {
+  id             String       @id @default(cuid())
+  rmaNumber      String       @unique @db.VarChar(24)
+  orderId        String
+  orderItemId    String
+  userId         String
+  type           ReturnType
+  status         ReturnStatus @default(REQUESTED)
+  quantity       Int
+  reason         String       @db.VarChar(200)
+  description    String?      @db.Text
+  /// Object-storage keys of customer-uploaded photos.
+  imageKeys      String[]     @default([])
+  resolutionNote String?      @db.VarChar(500)
+  refundId       String?      @unique
+  createdAt      DateTime     @default(now()) @db.Timestamptz(3)
+  updatedAt      DateTime     @updatedAt @db.Timestamptz(3)
+
+  order     Order     @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Restrict)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Restrict)
+  refund    Refund?   @relation(fields: [refundId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+}
+
+// -----------------------------------------------------------------------------
+// Support & AI agent
+// -----------------------------------------------------------------------------
+
+model SupportTicket {
+  id            String         @id @default(cuid())
+  ticketNumber  String         @unique @db.VarChar(24)
+  customerId    String?
+  orderId       String?
+  chatSessionId String?        @unique
+  category      TicketCategory
+  priority      TicketPriority @default(NORMAL)
+  status        TicketStatus   @default(OPEN)
+  subject       String         @db.VarChar(200)
+  /// AI-written hand-off summary.
+  summary       String         @db.Text
+  contactEmail  String?        @db.VarChar(320)
+  contactPhone  String?        @db.VarChar(16)
+  assignedToId  String?
+  resolvedAt    DateTime?      @db.Timestamptz(3)
+  createdAt     DateTime       @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime       @updatedAt @db.Timestamptz(3)
+
+  customer    User?        @relation("TicketCustomer", fields: [customerId], references: [id], onDelete: SetNull)
+  assignedTo  User?        @relation("TicketAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
+  order       Order?       @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  chatSession ChatSession? @relation(fields: [chatSessionId], references: [id], onDelete: SetNull)
+
+  @@index([status, priority, createdAt])
+  @@index([status, createdAt(sort: Desc)])
+  @@index([assignedToId, status])
+  @@index([customerId])
+}
+
+model ChatSession {
+  id            String            @id @default(cuid())
+  customerId    String?
+  /// Guest sessions are keyed by an HttpOnly cookie token.
+  guestToken    String?           @db.VarChar(64)
+  status        ChatSessionStatus @default(ACTIVE)
+  flaggedReason String?           @db.VarChar(200)
+  escalatedAt   DateTime?         @db.Timestamptz(3)
+  takenOverById String?
+  takenOverAt   DateTime?         @db.Timestamptz(3)
+  lastMessageAt DateTime          @default(now()) @db.Timestamptz(3)
+  createdAt     DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime          @updatedAt @db.Timestamptz(3)
+
+  customer    User?          @relation("ChatCustomer", fields: [customerId], references: [id], onDelete: SetNull)
+  takenOverBy User?          @relation("ChatAgent", fields: [takenOverById], references: [id], onDelete: SetNull)
+  messages    ChatMessage[]
+  ticket      SupportTicket?
+
+  @@index([customerId, lastMessageAt])
+  @@index([status, lastMessageAt])
+  @@index([guestToken])
+}
+
+model ChatMessage {
+  id         String   @id @default(cuid())
+  sessionId  String
+  role       ChatRole
+  content    String   @db.Text
+  toolName   String?  @db.VarChar(64)
+  toolCallId String?  @db.VarChar(128)
+  toolInput  Json?
+  toolOutput Json?
+  /// Human support agent who wrote the message (role = HUMAN_AGENT).
+  authorId   String?
+  /// Exact Messages API content blocks of this turn (assistant thinking / tool_use blocks, user
+  /// tool_result batches). Replayed unchanged on the next request so history is append-only.
+  apiContent Json?
+  /// Set by the prompt-injection guard.
+  flagged    Boolean  @default(false)
+  usage      Json?
+  createdAt  DateTime @default(now()) @db.Timestamptz(3)
+
+  session ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  author  User?       @relation(fields: [authorId], references: [id], onDelete: SetNull)
+
+  @@index([sessionId, createdAt])
+}
+
+/// RAG corpus: product specs, FAQs and policies chunked and embedded into pgvector.
+model KnowledgeChunk {
+  id          String                       @id @default(cuid())
+  sourceType  KnowledgeSourceType
+  /// Product id, or a stable slug for policy / FAQ documents.
+  sourceId    String                       @db.VarChar(160)
+  productId   String?
+  chunkIndex  Int
+  title       String                       @db.VarChar(200)
+  content     String                       @db.Text
+  /// sha256 of content - unchanged chunks are not re-embedded.
+  contentHash String                       @db.Char(64)
+  metadata    Json                         @default("{}")
+  tokenCount  Int?
+  embedding   Unsupported("vector(1024)")?
+  createdAt   DateTime                     @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime                     @updatedAt @db.Timestamptz(3)
+
+  product Product? @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([sourceType, sourceId, chunkIndex])
+  @@index([productId])
+}
+
+// -----------------------------------------------------------------------------
+// Notifications, webhooks, audit & analytics
+// -----------------------------------------------------------------------------
+
+model NotificationLog {
+  id                String              @id @default(cuid())
+  userId            String?
+  orderId           String?
+  channel           NotificationChannel
+  type              NotificationType
+  status            NotificationStatus  @default(QUEUED)
+  /// Email address or E.164 phone number.
+  recipient         String              @db.VarChar(320)
+  templateName      String?             @db.VarChar(100)
+  /// WhatsApp wamid / Resend id / SMTP message-id.
+  providerMessageId String?             @db.VarChar(255)
+  /// Template variables with secrets (OTP codes) removed.
+  payload           Json?
+  jobId             String?             @db.VarChar(128)
+  attempts          Int                 @default(0)
+  lastError         String?             @db.VarChar(1000)
+  sentAt            DateTime?           @db.Timestamptz(3)
+  deliveredAt       DateTime?           @db.Timestamptz(3)
+  readAt            DateTime?           @db.Timestamptz(3)
+  failedAt          DateTime?           @db.Timestamptz(3)
+  createdAt         DateTime            @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime            @updatedAt @db.Timestamptz(3)
+
+  user  User?  @relation(fields: [userId], references: [id], onDelete: SetNull)
+  order Order? @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  @@unique([channel, providerMessageId])
+  @@index([status, createdAt])
+  @@index([userId, createdAt])
+  @@index([orderId])
+}
+
+/// Replay protection: a webhook event id is processed at most once per source.
+model ProcessedWebhook {
+  id          String                  @id @default(cuid())
+  source      WebhookSource
+  eventId     String                  @db.VarChar(255)
+  eventType   String                  @db.VarChar(100)
+  status      WebhookProcessingStatus @default(PROCESSING)
+  payloadHash String                  @db.Char(64)
+  error       String?                 @db.VarChar(1000)
+  receivedAt  DateTime                @default(now()) @db.Timestamptz(3)
+  processedAt DateTime?               @db.Timestamptz(3)
+
+  @@unique([source, eventId])
+  @@index([status, receivedAt])
+}
+
+/// Immutable record of every admin mutation (UPDATE/DELETE blocked by trigger).
+model AdminAuditLog {
+  id         String           @id @default(cuid())
+  actorId    String
+  actorRole  Role
+  action     AdminAuditAction
+  entityType String           @db.VarChar(60)
+  entityId   String           @db.VarChar(64)
+  before     Json?
+  after      Json?
+  diff       Json?
+  reason     String?          @db.VarChar(500)
+  ip         String?          @db.VarChar(45)
+  userAgent  String?          @db.VarChar(512)
+  requestId  String?          @db.VarChar(64)
+  createdAt  DateTime         @default(now()) @db.Timestamptz(3)
+
+  actor User @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@index([entityType, entityId, createdAt])
+  @@index([actorId, createdAt])
+  @@index([action, createdAt])
+}
+
+/// Admin portal alert feed (low stock, escalations, dead-lettered notifications...).
+model AdminAlert {
+  id               String         @id @default(cuid())
+  type             AdminAlertType
+  severity         AlertSeverity  @default(WARNING)
+  title            String         @db.VarChar(160)
+  message          String         @db.VarChar(1000)
+  entityType       String?        @db.VarChar(60)
+  entityId         String?        @db.VarChar(64)
+  /// e.g. "low-stock:<variantId>:<yyyy-mm-dd>" - prevents duplicate alerts.
+  dedupeKey        String?        @unique @db.VarChar(160)
+  acknowledgedAt   DateTime?      @db.Timestamptz(3)
+  acknowledgedById String?
+  createdAt        DateTime       @default(now()) @db.Timestamptz(3)
+
+  acknowledgedBy User? @relation(fields: [acknowledgedById], references: [id], onDelete: SetNull)
+
+  @@index([acknowledgedAt, createdAt])
+  @@index([type, createdAt])
+}
+
+/// Daily KPI roll-up written by the analytics aggregation worker.
+model DailyMetric {
+  date                   DateTime @id @db.Date
+  currency               Currency @default(INR)
+  /// BigInt: a single day's GMV can exceed the int4 range (~₹2.1 crore in paise).
+  grossMerchandiseMinor  BigInt   @default(0)
+  netRevenueMinor        BigInt   @default(0)
+  refundsMinor           BigInt   @default(0)
+  ordersCount            Int      @default(0)
+  unitsSold              Int      @default(0)
+  storefrontSessions     Int      @default(0)
+  checkoutsStarted       Int      @default(0)
+  averageOrderValueMinor Int      @default(0)
+  updatedAt              DateTime @updatedAt @db.Timestamptz(3)
+}
+
+/// GST credit note issued for a successful refund, referencing the original tax invoice.
+/// Numbered CN/<financial year>/<serial> from credit_note_number_seq.
+model CreditNote {
+  id               String   @id @default(cuid())
+  creditNoteNumber String   @unique @db.VarChar(32)
+  orderId          String
+  refundId         String   @unique
+  /// Invoice number the note adjusts (snapshot).
+  invoiceNumber    String   @db.VarChar(32)
+  amountMinor      Int
+  taxMinor         Int
+  storageKey       String?  @db.VarChar(512)
+  issuedAt         DateTime @default(now()) @db.Timestamptz(3)
+
+  order  Order  @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  refund Refund @relation(fields: [refundId], references: [id], onDelete: Restrict)
+
+  @@index([orderId])
+}

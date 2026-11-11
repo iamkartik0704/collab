@@ -1,0 +1,93 @@
+@import "tailwindcss";
+
+/*
+ * Collab design tokens - from the E-Store (Figma) design system.
+ * Desktop frame 1440px with a 1120px content container; mobile frame 375px.
+ */
+@theme {
+  --font-sans: var(--font-inter), "SF Pro Display", ui-sans-serif, system-ui, -apple-system, sans-serif;
+
+  --color-ink: #000000;
+  --color-hero: #211c24;
+  --color-promo: #353535;
+  --color-promo-deep: #2c2c2c;
+  --color-subnav: #2e2e2e;
+  --color-surface: #f6f6f6;
+  --color-surface-2: #ededed;
+  --color-search: #f5f5f5;
+  --color-tint-1: #f9f9f9;
+  --color-tint-2: #eaeaea;
+  --color-muted: #909090;
+  --color-muted-2: #656565;
+  --color-line: #ebebeb;
+  --color-line-2: #d5d5d5;
+  --color-heart: #ff0000;
+  --color-star: #ffb547;
+  --color-success: #0f8a3c;
+  --color-danger: #d92d20;
+
+  --container-site: 1120px;
+
+  --radius-card: 9px;
+  --radius-control: 6px;
+
+  --animate-fade-in: fade-in 160ms ease-out;
+  --animate-slide-in-right: slide-in-right 260ms cubic-bezier(0.32, 0.72, 0, 1);
+  --animate-slide-in-left: slide-in-left 260ms cubic-bezier(0.32, 0.72, 0, 1);
+  --animate-scale-in: scale-in 180ms cubic-bezier(0.32, 0.72, 0, 1);
+
+  @keyframes fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  @keyframes slide-in-right {
+    from { transform: translateX(100%); }
+    to { transform: translateX(0); }
+  }
+  @keyframes slide-in-left {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(0); }
+  }
+  @keyframes scale-in {
+    from { opacity: 0; transform: translate(-50%, -48%) scale(0.97); }
+    to { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  }
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+  body {
+    @apply bg-white text-ink;
+  }
+  :focus-visible {
+    outline: 2px solid #000;
+    outline-offset: 2px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@utility container-site {
+  width: 100%;
+  max-width: var(--container-site);
+  margin-inline: auto;
+  padding-inline: 16px;
+  @media (width >= 1152px) {
+    padding-inline: 0;
+  }
+}
+
+@utility scrollbar-none {
+  scrollbar-width: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}

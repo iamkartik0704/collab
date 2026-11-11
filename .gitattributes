@@ -1,0 +1,12 @@
+# LF everywhere: shell scripts, Dockerfiles and nginx configs run inside Linux containers.
+* text=auto eol=lf
+*.sh text eol=lf
+Dockerfile* text eol=lf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.avif binary
+*.ico binary
+*.pdf binary
+*.woff2 binary

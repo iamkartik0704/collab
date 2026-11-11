@@ -1,0 +1,6 @@
+{
+  // The worker runs TypeScript directly with tsx (no Next.js compiler): use the automatic JSX
+  // runtime so React Email / react-pdf templates need no `import React`.
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "jsx": "react-jsx" }
+}

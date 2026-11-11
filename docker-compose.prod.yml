@@ -1,0 +1,182 @@
+# =============================================================================
+# Collab production stack (single host).
+#   1. cp .env.example .env.production   and fill in real values (APP_URL = https://<host>)
+#   2. put TLS certs in ./docker/nginx/certs (fullchain.pem, privkey.pem)
+#   3. IMAGE_TAG=<git sha> docker compose -f docker-compose.prod.yml --env-file .env.production up -d
+# The CI/CD pipeline (.github/workflows/ci-cd.yml) builds the images, pushes them to GHCR and
+# runs step 3 on the server. `migrate` runs before the app and the worker start.
+# Object storage is external (S3 / Cloudflare R2): set S3_* in .env.production.
+# =============================================================================
+name: collab
+
+x-app-env: &app-env
+  env_file: [.env.production]
+  environment:
+    NODE_ENV: production
+    DATABASE_URL: postgresql://${POSTGRES_USER:-collab}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@pgbouncer:5432/${POSTGRES_DB:-collab}?pgbouncer=true&connection_limit=10
+    DIRECT_DATABASE_URL: postgresql://${POSTGRES_USER:-collab}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-collab}
+    REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
+    AUTH_TRUST_HOST: "true"
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "20m", max-file: "5" }
+
+services:
+  nginx:
+    image: nginx:1.29-alpine
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./docker/nginx/certs:/etc/nginx/certs:ro
+      - certbot-webroot:/var/www/certbot:ro
+    depends_on:
+      app: { condition: service_healthy }
+    networks: [edge]
+    logging: *logging
+
+  app:
+    image: ghcr.io/${GITHUB_REPOSITORY:-collab/collab-web}/app:${IMAGE_TAG:-latest}
+    <<: *app-env
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+      resources:
+        limits: { cpus: "1.5", memory: 1536M }
+    read_only: true
+    tmpfs: ["/tmp:size=256m"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      pgbouncer: { condition: service_started }
+      redis: { condition: service_healthy }
+    networks: [edge, backend]
+    logging: *logging
+
+  worker:
+    image: ghcr.io/${GITHUB_REPOSITORY:-collab/collab-web}/worker:${IMAGE_TAG:-latest}
+    <<: *app-env
+    restart: unless-stopped
+    deploy:
+      replicas: 1
+      resources:
+        limits: { cpus: "1", memory: 1G }
+    read_only: true
+    tmpfs: ["/tmp:size=256m"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    stop_grace_period: 40s
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      pgbouncer: { condition: service_started }
+      redis: { condition: service_healthy }
+    networks: [backend]
+    logging: *logging
+
+  migrate:
+    image: ghcr.io/${GITHUB_REPOSITORY:-collab/collab-web}/migrate:${IMAGE_TAG:-latest}
+    <<: *app-env
+    restart: "no"
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [backend]
+    logging: *logging
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-collab}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-collab}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    command: ["postgres", "-c", "max_connections=200", "-c", "shared_buffers=512MB", "-c", "effective_cache_size=1536MB", "-c", "lock_timeout=10s", "-c", "idle_in_transaction_session_timeout=60s"]
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-collab} -d ${POSTGRES_DB:-collab}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    shm_size: 256mb
+    networks: [backend]
+    logging: *logging
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    restart: unless-stopped
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: ${POSTGRES_USER:-collab}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      DB_NAME: ${POSTGRES_DB:-collab}
+      POOL_MODE: transaction
+      AUTH_TYPE: scram-sha-256
+      MAX_CLIENT_CONN: "1000"
+      DEFAULT_POOL_SIZE: "40"
+      SERVER_RESET_QUERY: DISCARD ALL
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [backend]
+    logging: *logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # noeviction: BullMQ and locks must never lose keys silently.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory", "1gb", "--maxmemory-policy", "noeviction", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD}"]
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" --no-auth-warning ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    networks: [backend]
+    logging: *logging
+
+  # Daily pg_dump (02:00 IST) with retention; see docker/backup/pg-backup.sh for restore steps.
+  # Sync ./backups off the host (object storage) - same-disk backups do not survive disk loss.
+  backup:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/usr/local/bin/pg-backup.sh"]
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-collab}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB:-collab}
+      BACKUP_TIME: ${BACKUP_TIME:-20:30}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      BACKUP_ON_START: "false"
+    volumes:
+      - ./docker/backup/pg-backup.sh:/usr/local/bin/pg-backup.sh:ro
+      - ./backups:/backups
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [backend]
+    logging: *logging
+
+  # Optional: issue / renew certificates (`docker compose run --rm certbot renew`).
+  certbot:
+    image: certbot/certbot:latest
+    profiles: ["tools"]
+    volumes:
+      - ./docker/nginx/certs:/etc/letsencrypt/live/collab:rw
+      - certbot-webroot:/var/www/certbot
+    entrypoint: ["certbot"]
+
+networks:
+  edge: {}
+  backend:
+    internal: true
+
+volumes:
+  postgres-data:
+  redis-data:
+  certbot-webroot:

@@ -1,0 +1,41 @@
+# dependencies
+node_modules/
+
+# next.js / build output
+.next/
+out/
+dist/
+next-env.d.ts
+*.tsbuildinfo
+
+# tests
+coverage/
+playwright-report/
+test-results/
+
+# env & secrets - only .env.example is committed
+.env
+.env.*
+!.env.example
+
+# logs & os
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# playwright auth state (contains session cookies)
+tests/e2e/.auth/
+
+# docker data, backups and TLS material (never committed)
+backups/
+*.dump
+docker/nginx/certs/
+data/
+minio-data/
+postgres-data/
+redis-data/
+
+# local tooling
+.vscode/
+.idea/

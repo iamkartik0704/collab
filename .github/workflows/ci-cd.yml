@@ -1,0 +1,264 @@
+# Collab CI/CD
+#   every push / PR : lint, typecheck, migration guard, unit tests, Playwright e2e
+#   main            : + build & push app / worker / migrate images to GHCR, Trivy scan, deploy
+#
+# Repository configuration:
+#   variables  APP_URL (https://collab.example.com), NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY,
+#              NEXT_PUBLIC_RAZORPAY_KEY_ID, S3_PUBLIC_BASE_URL
+#   secrets    DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY (production environment)
+# The server keeps /opt/collab (docker-compose.prod.yml, docker/nginx, .env.production).
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "22.20.0"
+
+jobs:
+  quality:
+    name: Lint, types, unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Prisma schema
+        run: npx prisma validate
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+          DIRECT_DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+      - name: Migration guard (no dropped hand-written SQL)
+        run: npm run db:check-migrations
+      - run: npm run lint
+      - run: npm run typecheck
+      - name: Unit tests
+        run: npx vitest run --coverage
+      - name: Dependency audit (production, high+)
+        run: npm audit --omit=dev --audit-level=high
+        continue-on-error: true
+
+  e2e:
+    name: Playwright e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: collab
+          POSTGRES_PASSWORD: collab
+          POSTGRES_DB: collab
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U collab -d collab" --health-interval 5s --health-timeout 3s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Write test environment
+        run: |
+          cat > .env <<EOF
+          NODE_ENV=production
+          APP_URL=http://localhost:3100
+          NEXT_PUBLIC_APP_URL=http://localhost:3100
+          LOG_LEVEL=warn
+          DATABASE_URL=postgresql://collab:collab@localhost:5432/collab?connection_limit=10
+          DIRECT_DATABASE_URL=postgresql://collab:collab@localhost:5432/collab
+          REDIS_URL=redis://localhost:6379/0
+          AUTH_SECRET=$(openssl rand -base64 48 | tr -d '\n')
+          AUTH_TOKEN_PEPPER=$(openssl rand -base64 48 | tr -d '\n')
+          AUTH_TRUST_HOST=true
+          AUTH_GOOGLE_ID=ci
+          AUTH_GOOGLE_SECRET=ci
+          STRIPE_SECRET_KEY=sk_test_ci
+          STRIPE_WEBHOOK_SECRET=whsec_ci
+          NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=pk_test_ci
+          RAZORPAY_KEY_ID=rzp_test_ci
+          RAZORPAY_KEY_SECRET=ci
+          RAZORPAY_WEBHOOK_SECRET=ci
+          NEXT_PUBLIC_RAZORPAY_KEY_ID=rzp_test_ci
+          S3_ENDPOINT=http://localhost:9000
+          S3_REGION=us-east-1
+          S3_BUCKET=collab-assets
+          S3_ACCESS_KEY_ID=ci
+          S3_SECRET_ACCESS_KEY=ci-secret
+          S3_FORCE_PATH_STYLE=true
+          S3_PUBLIC_BASE_URL=http://localhost:9000/collab-assets
+          WHATSAPP_PHONE_NUMBER_ID=100000000000000
+          WHATSAPP_BUSINESS_ACCOUNT_ID=100000000000001
+          WHATSAPP_ACCESS_TOKEN=ci
+          WHATSAPP_APP_SECRET=ci
+          WHATSAPP_WEBHOOK_VERIFY_TOKEN=ci-verify-token-0000
+          EMAIL_PROVIDER=log
+          EMAIL_FROM="Collab <orders@collab.example.com>"
+          NOTIFICATIONS_DRY_RUN=true
+          ALLOW_DRY_RUN_IN_PRODUCTION=1
+          ANTHROPIC_API_KEY=sk-ant-ci-placeholder
+          VOYAGE_API_KEY=ci
+          ADMIN_ALERT_EMAILS=ops@collab.example.com
+          ADMIN_ALERT_WHATSAPP_NUMBERS=+919800000000
+          EOF
+          sed -i 's/^ *//' .env
+      - name: Migrate and seed
+        run: |
+          set -a; . ./.env; set +a
+          npx prisma migrate deploy
+          npm run db:seed
+      - name: Build (for the e2e origin)
+        run: |
+          set -a; . ./.env; set +a
+          npm run build
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Run e2e
+        run: npm run test:e2e
+        env:
+          CI: "true"
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+
+  images:
+    name: Build, scan & push images
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [quality, e2e]
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: vars
+        run: |
+          echo "repo=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: App image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runner
+          push: true
+          tags: |
+            ghcr.io/${{ steps.vars.outputs.repo }}/app:${{ steps.vars.outputs.tag }}
+            ghcr.io/${{ steps.vars.outputs.repo }}/app:latest
+          build-args: |
+            NEXT_PUBLIC_APP_URL=${{ vars.APP_URL }}
+            NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=${{ vars.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY }}
+            NEXT_PUBLIC_RAZORPAY_KEY_ID=${{ vars.NEXT_PUBLIC_RAZORPAY_KEY_ID }}
+            S3_PUBLIC_BASE_URL=${{ vars.S3_PUBLIC_BASE_URL }}
+            APP_VERSION=${{ steps.vars.outputs.tag }}
+          cache-from: type=gha,scope=app
+          cache-to: type=gha,mode=max,scope=app
+      - name: Migrate image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: migrate
+          push: true
+          tags: |
+            ghcr.io/${{ steps.vars.outputs.repo }}/migrate:${{ steps.vars.outputs.tag }}
+            ghcr.io/${{ steps.vars.outputs.repo }}/migrate:latest
+          build-args: |
+            NEXT_PUBLIC_APP_URL=${{ vars.APP_URL }}
+          cache-from: type=gha,scope=app
+      - name: Worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.worker
+          push: true
+          tags: |
+            ghcr.io/${{ steps.vars.outputs.repo }}/worker:${{ steps.vars.outputs.tag }}
+            ghcr.io/${{ steps.vars.outputs.repo }}/worker:latest
+          build-args: |
+            APP_VERSION=${{ steps.vars.outputs.tag }}
+          cache-from: type=gha,scope=worker
+          cache-to: type=gha,mode=max,scope=worker
+      - name: Trivy scan (app)
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: ghcr.io/${{ steps.vars.outputs.repo }}/app:${{ steps.vars.outputs.tag }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Trivy scan (worker)
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: ghcr.io/${{ steps.vars.outputs.repo }}/worker:${{ steps.vars.outputs.tag }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+  deploy:
+    name: Deploy to production
+    needs: images
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: production
+      url: ${{ vars.APP_URL }}
+    steps:
+      - name: Pull and restart on the server
+        uses: appleboy/ssh-action@v1
+        env:
+          IMAGE_TAG: ${{ needs.images.outputs.tag }}
+          REPO: ${{ github.repository }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: IMAGE_TAG,REPO
+          script: |
+            set -euo pipefail
+            cd /opt/collab
+            export IMAGE_TAG GITHUB_REPOSITORY="${REPO,,}"
+            docker compose -f docker-compose.prod.yml --env-file .env.production pull app worker migrate
+            # migrate runs first (app and worker depend on it completing successfully).
+            docker compose -f docker-compose.prod.yml --env-file .env.production up -d --remove-orphans
+            docker image prune -f --filter "until=168h"
+      - name: Smoke test
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS "${{ vars.APP_URL }}/api/health" >/dev/null; then echo "healthy"; exit 0; fi
+            sleep 5
+          done
+          echo "health check failed" && exit 1
