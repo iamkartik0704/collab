@@ -8,7 +8,8 @@ import { queueNotification } from "@/server/notifications/notify";
  * ABANDONED_AFTER (and still holds something buyable) gets exactly one reminder:
  *  - email when the customer allows cart reminders (NotificationPreference.abandonedCartReminder);
  *  - WhatsApp only with an explicit marketing opt-in;
- *  - nothing at all for customers who replied STOP on WhatsApp (whatsappOptOutAt).
+ *  - a STOP reply on WhatsApp (whatsappOptOutAt) suppresses the WhatsApp reminder only; email
+ *    still goes out unless the customer turned email cart reminders off.
  * The cart is claimed with a conditional update before anything is queued, so concurrent
  * workers or a retried job never send twice. Guest carts have no contact details and are skipped.
  */
@@ -70,14 +71,13 @@ export async function sendAbandonedCartReminders(now = new Date()): Promise<{ co
         item.variant.isActive && !item.variant.deletedAt && item.variant.product.status === "ACTIVE" && !item.variant.product.deletedAt && (item.variant.inventory?.quantityAvailable ?? 0) > 0,
     );
     const wantsEmail = Boolean(user?.email) && (prefs?.abandonedCartReminder ?? true);
-    const wantsWhatsApp = Boolean(user?.phone) && Boolean(prefs?.whatsappOptIn && prefs.whatsappMarketing);
-    const optedOut = Boolean(prefs?.whatsappOptOutAt);
+    const wantsWhatsApp = Boolean(user?.phone) && Boolean(prefs?.whatsappOptIn && prefs.whatsappMarketing) && !prefs?.whatsappOptOutAt;
 
     // Claim first: whatever happens next, this cart is never reminded again.
     const claim = await db.cart.updateMany({ where: { id: cart.id, abandonedReminderSentAt: null, lastActivityAt: cart.lastActivityAt }, data: { abandonedReminderSentAt: now } });
     if (claim.count === 0) continue; // the customer came back, or another worker took it
 
-    if (!user || !user.isActive || optedOut || buyable.length === 0 || (!wantsEmail && !wantsWhatsApp)) {
+    if (!user || !user.isActive || buyable.length === 0 || (!wantsEmail && !wantsWhatsApp)) {
       skipped++;
       continue;
     }

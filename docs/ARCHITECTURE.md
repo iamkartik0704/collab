@@ -206,7 +206,7 @@ Every committed stock change publishes an `InventoryEvent` on the Redis channel 
 
 ### Abandoned-cart reminders
 
-Signed-in carts idle for 2+ hours (and active within the last 7 days) that still hold something buyable get **one** reminder: the cart is claimed with a conditional update before anything is queued, and the flag resets only when a purchase empties the cart. Email requires `abandonedCartReminder` (default on); WhatsApp requires an explicit marketing opt-in; customers who replied STOP on WhatsApp (`NotificationPreference.whatsappOptOutAt`) get no reminder at all; customers who paid since their last cart activity are skipped. Guest carts have no contact details and are never reminded.
+Signed-in carts idle for 2+ hours (and active within the last 7 days) that still hold something buyable get **one** reminder: the cart is claimed with a conditional update before anything is queued, and the flag resets only when a purchase empties the cart. Email requires `abandonedCartReminder` (default on); WhatsApp requires an explicit marketing opt-in; a STOP reply on WhatsApp (`NotificationPreference.whatsappOptOutAt`) suppresses the WhatsApp reminder only, so the email still goes out unless email cart reminders are off; customers who paid since their last cart activity are skipped. Guest carts have no contact details and are never reminded.
 
 ### AI support agent
 

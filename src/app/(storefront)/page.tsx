@@ -14,7 +14,7 @@ export default async function HomePage() {
 
   return (
     <>
-      <Hero hero={showcase.hero} />
+      <Hero />
       <BentoGrid bento={showcase.bento} />
       <div className="bg-tint-1">
         <CategoryCarousel categories={categories} />

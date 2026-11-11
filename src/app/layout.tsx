@@ -1,11 +1,25 @@
 import type { Metadata, Viewport } from "next";
-import { Inter } from "next/font/google";
+import localFont from "next/font/local";
 import type { ReactNode } from "react";
 import { env } from "@/env";
 import { Providers } from "@/components/providers";
 import "./globals.css";
 
-const inter = Inter({ subsets: ["latin"], weight: ["400", "500", "600", "700"], variable: "--font-inter", display: "swap" });
+/**
+ * Inter, self-hosted (src/app/fonts, SIL OFL 1.1 - see Inter-LICENSE.txt): one variable woff2
+ * subset to Latin + Latin Extended-A + the Rupee sign, with the full 100-900 weight axis.
+ * Self-hosting avoids build-time requests to Google Fonts (and Turbopack's next/font/google
+ * failure on Google's `/l/font?kit=` URLs).
+ */
+const inter = localFont({
+  src: "./fonts/InterVariable-subset.woff2",
+  weight: "100 900",
+  style: "normal",
+  variable: "--font-inter",
+  display: "swap",
+  fallback: ["ui-sans-serif", "system-ui", "-apple-system", "Segoe UI", "sans-serif"],
+  adjustFontFallback: "Arial",
+});
 
 export const metadata: Metadata = {
   metadataBase: new URL(env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"),

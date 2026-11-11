@@ -6,14 +6,23 @@ import { getProductCardsBySlugs } from "./catalog.service";
  * Home-page merchandising: which products fill the hero, bento grid, feature strip and sale
  * banner, with their marketing copy. Missing or inactive products simply drop out.
  */
-export const HOME_MERCHANDISING = {
-  hero: {
-    slug: "iphone-14-pro",
+/**
+ * Flagship brand hero (static, not a catalogue product). The cutout and its alpha mask live in
+ * public/images/hero/; replace them (same file names, any size) to change the hero hardware.
+ */
+export const HERO_BRAND = {
+  copy: {
     eyebrow: "Pro.Beyond.",
-    titleLight: "IPhone 14",
-    titleBold: "Pro",
+    titleLight: "Made by",
+    titleBold: "Collab",
     subtitle: "Created to change everything for the better. For everyone",
+    backdrop: "Pro.Beyond.",
   },
+  cta: { label: "Shop Now", href: "/catalog" },
+  image: { src: "/images/hero/collab-kettle.png", mask: "/images/hero/collab-kettle-mask.png", alt: "Collab electric kettle in matte black", width: 903, height: 974 },
+} as const;
+
+export const HOME_MERCHANDISING = {
   bento: {
     wide: {
       slug: "playstation-5",
@@ -51,7 +60,6 @@ export interface Showcase<T> {
 }
 
 export interface HomeShowcase {
-  hero: Showcase<(typeof HOME_MERCHANDISING)["hero"]> | null;
   bento: {
     wide: Showcase<(typeof HOME_MERCHANDISING)["bento"]["wide"]> | null;
     audio: Showcase<(typeof HOME_MERCHANDISING)["bento"]["audio"]> | null;
@@ -69,7 +77,6 @@ export async function getHomeShowcase(): Promise<HomeShowcase> {
     async (): Promise<HomeShowcase> => {
       const m = HOME_MERCHANDISING;
       const slugs = [
-        m.hero.slug,
         m.bento.wide.slug,
         m.bento.audio.slug,
         m.bento.vr.slug,
@@ -83,7 +90,6 @@ export async function getHomeShowcase(): Promise<HomeShowcase> {
         return card ? { card, copy } : null;
       };
       return {
-        hero: pick(m.hero),
         bento: { wide: pick(m.bento.wide), audio: pick(m.bento.audio), vr: pick(m.bento.vr), laptop: pick(m.bento.laptop) },
         featureStrip: m.featureStrip.map(pick).filter((item): item is NonNullable<typeof item> => item !== null),
         saleArt: m.saleBanner.artSlugs

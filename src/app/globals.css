@@ -91,3 +91,15 @@
     display: none;
   }
 }
+
+/* Hero stage: users who prefer reduced motion get the fully lit studio from the first paint
+   (the entrance starts dark and is skipped for them; see components/home/hero-stage.tsx). */
+@media (prefers-reduced-motion: reduce) {
+  [data-hero-subject] {
+    filter: none !important;
+  }
+  [data-hero-glow] {
+    opacity: 1 !important;
+    transform: translateZ(-60px) !important;
+  }
+}

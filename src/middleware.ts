@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import NextAuth from "next-auth";
 import { NextResponse } from "next/server";
 import { authConfig } from "@/lib/auth/config";
@@ -28,8 +27,9 @@ function jsonError(status: number, code: string, message: string): NextResponse 
 }
 
 export default auth((request) => {
-  const requestId = request.headers.get("x-request-id") ?? randomUUID();
-  const nonce = Buffer.from(randomUUID()).toString("base64");
+  // Web Crypto + btoa are globals in every runtime (no node:crypto import for Turbopack to flag).
+  const requestId = request.headers.get("x-request-id") ?? crypto.randomUUID();
+  const nonce = btoa(crypto.randomUUID());
   const csp = buildContentSecurityPolicy(nonce);
   const { pathname, search } = request.nextUrl;
   const isApi = pathname.startsWith("/api/");
