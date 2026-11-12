@@ -337,7 +337,17 @@ async function unrestockedLines(tx: TransactionClient, orderId: string): Promise
 async function createRefundRecord(
   tx: TransactionClient,
   ctx: AdminContext,
-  input: { orderId: string; payment: { id: string; provider: "STRIPE" | "RAZORPAY" }; amountMinor: number; reason: string; idempotencyKey: string },
+  input: {
+    orderId: string;
+    payment: { id: string; provider: "STRIPE" | "RAZORPAY" };
+    amountMinor: number;
+    reason: string;
+    idempotencyKey: string;
+    /** Item-mode only: what this refund decremented, so a FAILED refund can give it back. */
+    lines: Array<{ orderItemId: string; variantId: string; quantity: number }>;
+    /** Whether units were returned to stock by this refund. */
+    restocked: boolean;
+  },
 ) {
   const refund = await tx.refund.create({
     data: {
@@ -348,6 +358,8 @@ async function createRefundRecord(
       reason: input.reason.slice(0, 500),
       idempotencyKey: input.idempotencyKey,
       initiatedById: ctx.actor.id,
+      lines: input.lines,
+      restocked: input.restocked,
     },
     select: { id: true, amountMinor: true },
   });
@@ -500,6 +512,10 @@ export async function transitionOrderStatus(
             amountMinor: refundableMinor,
             reason: input.note ?? (cancellingPaid ? "Order cancelled before dispatch" : "Order returned"),
             idempotencyKey: idempotencyKeyFor(ctx, orderId, clientIdempotencyKey, `transition-${input.to}`),
+            // A cancellation/return refund covers the whole order; the units were handled above by
+            // restockUnits, so there is nothing item-level to reverse here.
+            lines: [],
+            restocked: false,
           });
           refundId = refund.id;
           effects.add(`refund-${refund.id}`, () => enqueueRefundExecution(refund.id));
@@ -581,6 +597,7 @@ export async function createRefund(
 
       let amountMinor: number;
       const restockLines: Array<{ variantId: string; quantity: number }> = [];
+      const refundLines: Array<{ orderItemId: string; variantId: string; quantity: number }> = [];
       if (input.mode === "items") {
         amountMinor = 0;
         const items = await tx.orderItem.findMany({ where: { orderId, id: { in: input.items.map((item) => item.orderItemId) } } });
@@ -596,6 +613,7 @@ export async function createRefund(
           amountMinor += lineShare(item.lineTotalMinor, item.quantity, item.refundedQuantity, requested.quantity);
           await tx.orderItem.update({ where: { id: item.id }, data: { refundedQuantity: { increment: requested.quantity } } });
           restockLines.push({ variantId: item.variantId, quantity: requested.quantity });
+          refundLines.push({ orderItemId: item.id, variantId: item.variantId, quantity: requested.quantity });
         }
         amountMinor = Math.min(amountMinor, refundableMinor);
       } else {
@@ -613,7 +631,15 @@ export async function createRefund(
         await restockUnits(tx, { orderId, lines: restockLines, type: "CUSTOMER_RETURN", note: `${order.orderNumber} partial return`, actorId: ctx.actor.id, effects });
       }
 
-      const refund = await createRefundRecord(tx, ctx, { orderId, payment, amountMinor, reason: input.reason, idempotencyKey });
+      const refund = await createRefundRecord(tx, ctx, {
+        orderId,
+        payment,
+        amountMinor,
+        reason: input.reason,
+        idempotencyKey,
+        lines: refundLines,
+        restocked: input.restock === true && restockLines.length > 0,
+      });
       effects.add(`refund-${refund.id}`, () => enqueueRefundExecution(refund.id));
       effects.add(`refund-notice-${refund.id}`, () => queueOrderNotification({ orderId, type: "REFUND_ISSUED", templateData: { refundMinor: amountMinor } }));
       return { refundId: refund.id, amountMinor };

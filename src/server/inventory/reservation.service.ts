@@ -504,3 +504,42 @@ export async function restockUnits(
   }
   return units;
 }
+
+/**
+ * Takes back units that a refund had restocked after the payment provider reported that refund as
+ * FAILED. The reversal is clamped to what is still on hand above the reserved quantity: those units
+ * may have been sold again in the meantime, and stock must never go negative or break the
+ * `InventoryItem_*` CHECK constraints. The movement note records how many units were reversed.
+ */
+export async function unrestockUnits(
+  tx: TransactionClient,
+  input: { orderId: string; lines: readonly StockLine[]; note: string; effects: PostCommitEffects },
+): Promise<number> {
+  const totals = aggregate(input.lines);
+  const rows = await lockInventory(tx, [...totals.keys()]);
+  let units = 0;
+  for (const [variantId, quantity] of [...totals.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    const row = rows.get(variantId);
+    if (!row) continue;
+    const reversible = Math.min(quantity, row.quantityOnHand - row.quantityReserved);
+    if (reversible <= 0) continue;
+    rows.set(
+      variantId,
+      await applyChange(
+        tx,
+        row,
+        { onHandDelta: -reversible, reservedDelta: 0 },
+        {
+          type: "MANUAL_ADJUSTMENT",
+          reason: "SYSTEM_CORRECTION",
+          note: `${input.note} (reversed ${reversible}/${quantity})`.slice(0, 500),
+          orderId: input.orderId,
+          actorId: null,
+        },
+        input.effects,
+      ),
+    );
+    units += reversible;
+  }
+  return units;
+}

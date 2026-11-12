@@ -29,6 +29,11 @@ export const RateLimitPolicies = {
   checkout: { name: "checkout", limit: 15, windowMs: 60_000, failMode: "closed" },
   /** AI chatbot: 20 messages / 10 min / user. */
   aiChat: { name: "ai-chat", limit: 20, windowMs: 10 * 60_000, failMode: "closed" },
+  /**
+   * AI chatbot, signed-out visitors: 10 messages / 10 min / IP. Keyed on the IP rather than the
+   * guest cookie, which the server hands out on demand and a client can therefore reset at will.
+   */
+  aiChatGuest: { name: "ai-chat-guest", limit: 10, windowMs: 10 * 60_000, failMode: "closed" },
   /** Public API / catalog: 120 requests / min / IP. */
   publicApi: { name: "public-api", limit: 120, windowMs: 60_000, failMode: "open" },
   /** Admin portal mutations: 120 requests / min / staff user. */
