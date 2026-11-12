@@ -254,6 +254,10 @@ jobs:
             docker compose -f docker-compose.prod.yml --env-file .env.production pull app worker migrate
             # migrate runs first (app and worker depend on it completing successfully).
             docker compose -f docker-compose.prod.yml --env-file .env.production up -d --remove-orphans
+            # nginx re-resolves `app` on its own, but a reload also applies config changes and makes
+            # sure no stale upstream survives the deploy (graceful: SSE streams are not dropped).
+            docker compose -f docker-compose.prod.yml --env-file .env.production exec -T nginx nginx -t
+            docker compose -f docker-compose.prod.yml --env-file .env.production exec -T nginx nginx -s reload
             docker image prune -f --filter "until=168h"
       - name: Smoke test
         run: |

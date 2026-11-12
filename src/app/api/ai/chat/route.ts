@@ -31,6 +31,9 @@ const getSchema = z.object({ sessionId: z.string().min(10).max(40) });
 
 /** GET /api/ai/chat?sessionId= - the visible transcript and status (the widget polls it during a hand-off). */
 export const GET = route(async (request) => {
+  // The widget polls this during a hand-off; without a limit it is an unauthenticated way to make
+  // the app query Postgres in a loop.
+  await enforceRateLimit(RateLimitPolicies.publicApi, `ai-chat-read:${getClientIp(request.headers)}`);
   const { sessionId } = getSchema.parse(Object.fromEntries(request.nextUrl.searchParams));
   const session = await findOwnedSession(sessionId, await identify(request));
   const messages = (await loadTranscript(session.id)).map(({ id, role, text, author, createdAt }) => ({ id, role, text, author, createdAt }));
@@ -57,8 +60,15 @@ export const POST = route(async (request) => {
     tokenHash = fresh.hash;
     setCookie = cookieHeader(fresh.token);
   }
-  await enforceRateLimit(RateLimitPolicies.aiChat, identity.user ? `user:${identity.user.id}` : `guest:${tokenHash}`);
-  await enforceRateLimit(RateLimitPolicies.publicApi, `ai-chat-ip:${getClientIp(request.headers)}`);
+  const clientIp = getClientIp(request.headers);
+  if (identity.user) {
+    await enforceRateLimit(RateLimitPolicies.aiChat, `user:${identity.user.id}`);
+  } else {
+    // Keyed on the IP, not the guest token: the server mints a fresh token (and a fresh session)
+    // for any request without the cookie, so a cookie-discarding client would reset its own budget.
+    await enforceRateLimit(RateLimitPolicies.aiChatGuest, `guest-ip:${clientIp}`);
+  }
+  await enforceRateLimit(RateLimitPolicies.publicApi, `ai-chat-ip:${clientIp}`);
 
   let session = body.sessionId ? await findOwnedSession(body.sessionId, identity).catch(() => null) : null;
   if (!session || session.status === "CLOSED") session = await createSession(identity, tokenHash);

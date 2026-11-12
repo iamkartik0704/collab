@@ -237,6 +237,9 @@ enum NotificationType {
 
 enum NotificationStatus {
   QUEUED
+  /// Claimed by a worker: the provider call is in flight, or its outcome is unknown (timeout /
+  /// crash). A retry inside the lease window must not re-send, or WhatsApp customers see duplicates.
+  SENDING
   SENT
   DELIVERED
   READ
@@ -931,6 +934,11 @@ model Refund {
   idempotencyKey   String          @unique @db.VarChar(128)
   initiatedById    String?
   processedAt      DateTime?       @db.Timestamptz(3)
+  /// Item-mode refunds: the units decremented from OrderItem.refundedQuantity, so they can be
+  /// given back if the provider reports the refund as FAILED. [{ orderItemId, variantId, quantity }]
+  lines            Json?
+  /// True when this refund also put units back on the shelf; a FAILED refund reverses that too.
+  restocked        Boolean         @default(false)
   createdAt        DateTime        @default(now()) @db.Timestamptz(3)
   updatedAt        DateTime        @updatedAt @db.Timestamptz(3)
 

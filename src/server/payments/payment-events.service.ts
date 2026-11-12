@@ -5,7 +5,7 @@ import { PostCommitEffects } from "@/lib/post-commit";
 import { cancelReservationExpiry, enqueueCreditNote, enqueueImmediateRelease, enqueueRefundExecution } from "@/queues";
 import { clearPurchasedItems } from "@/server/cart/cart.service";
 import { restoreCouponRedemption } from "@/server/coupons/coupon.service";
-import { consumeReservations } from "@/server/inventory/reservation.service";
+import { consumeReservations, unrestockUnits } from "@/server/inventory/reservation.service";
 import { queueNotification } from "@/server/notifications/notify";
 import { lockOrder, transitionOrder, withOrderLock } from "@/server/orders/order-lock";
 import { getPaymentGateway } from "./index";
@@ -311,7 +311,9 @@ export async function handleRefundUpdated(event: RefundUpdatedEvent): Promise<"u
  * and sets PARTIALLY_REFUNDED / REFUNDED.
  */
 async function applyRefundStatus(refundId: string, status: "SUCCEEDED" | "FAILED"): Promise<boolean> {
-  const applied = await applyRefundStatusInTx(refundId, status);
+  const effects = new PostCommitEffects();
+  const applied = await applyRefundStatusInTx(refundId, status, effects);
+  await effects.flush();
   if (applied && status === "SUCCEEDED") {
     // GST credit note against the original invoice; the hourly sweep retries if Redis is down.
     await enqueueCreditNote(refundId).catch((error: unknown) => logger.error({ err: error, refundId }, "credit note not queued"));
@@ -319,13 +321,74 @@ async function applyRefundStatus(refundId: string, status: "SUCCEEDED" | "FAILED
   return applied;
 }
 
-async function applyRefundStatusInTx(refundId: string, status: "SUCCEEDED" | "FAILED"): Promise<boolean> {
+interface RecordedRefundLine {
+  orderItemId: string;
+  variantId: string;
+  quantity: number;
+}
+
+function recordedLines(value: unknown): RecordedRefundLine[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((raw) => {
+    const line = raw as Partial<RecordedRefundLine> | null;
+    if (!line || typeof line.orderItemId !== "string" || typeof line.variantId !== "string") return [];
+    if (typeof line.quantity !== "number" || !Number.isFinite(line.quantity) || line.quantity <= 0) return [];
+    return [{ orderItemId: line.orderItemId, variantId: line.variantId, quantity: Math.floor(line.quantity) }];
+  });
+}
+
+async function applyRefundStatusInTx(refundId: string, status: "SUCCEEDED" | "FAILED", effects: PostCommitEffects): Promise<boolean> {
   return withTransaction(async (tx) => {
     const transitioned = await tx.refund.updateMany({
       where: { id: refundId, status: "PENDING" },
       data: { status, processedAt: new Date() },
     });
     if (transitioned.count === 0) return false;
+
+    if (status === "FAILED") {
+      // The refund decremented item quantities and (optionally) put units back on the shelf before
+      // the provider call, which has now failed. Nothing was refunded, so undo both.
+      const refund = await tx.refund.findUniqueOrThrow({
+        where: { id: refundId },
+        select: { orderId: true, restocked: true, lines: true },
+      });
+      const lines = recordedLines(refund.lines);
+
+      for (const line of lines) {
+        await tx.orderItem.updateMany({
+          where: { id: line.orderItemId, orderId: refund.orderId, refundedQuantity: { gte: line.quantity } },
+          data: { refundedQuantity: { decrement: line.quantity } },
+        });
+      }
+
+      if (refund.restocked && lines.length > 0) {
+        try {
+          await unrestockUnits(tx, {
+            orderId: refund.orderId,
+            lines: lines.map(({ variantId, quantity }) => ({ variantId, quantity })),
+            note: `refund ${refundId} failed at the provider; stock reversal`,
+            effects,
+          });
+        } catch (error) {
+          // Never fail the status transition over the stock reversal: raise it for an operator.
+          await tx.adminAlert.createMany({
+            data: [
+              {
+                type: "PAYMENT_ANOMALY",
+                severity: "WARNING",
+                title: `Refund failed; stock reversal incomplete (${refundId})`,
+                message: (error as Error).message.slice(0, 900),
+                entityType: "Refund",
+                entityId: refundId,
+                dedupeKey: `refund-reversal:${refundId}`,
+              },
+            ],
+            skipDuplicates: true,
+          });
+        }
+      }
+    }
+
     if (status === "SUCCEEDED") {
       const refund = await tx.refund.findUniqueOrThrow({ where: { id: refundId }, select: { paymentId: true, amountMinor: true } });
       const payment = await tx.payment.update({

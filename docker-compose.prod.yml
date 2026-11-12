@@ -73,7 +73,10 @@ services:
       migrate: { condition: service_completed_successfully }
       pgbouncer: { condition: service_started }
       redis: { condition: service_healthy }
-    networks: [backend]
+    # The worker calls third-party APIs (Resend/SMTP, Meta WhatsApp, Stripe/Razorpay, S3/R2,
+    # Anthropic, Voyage): it needs egress, so it joins `edge` as the app does. Database traffic
+    # still goes over the internal `backend` network.
+    networks: [edge, backend]
     logging: *logging
 
   migrate:
@@ -162,14 +165,30 @@ services:
     networks: [backend]
     logging: *logging
 
-  # Optional: issue / renew certificates (`docker compose run --rm certbot renew`).
+  # Optional: issue / renew certificates.
+  #
+  #   docker compose -f docker-compose.prod.yml --env-file .env.production \
+  #     --profile tools run --rm certbot
+  #   docker compose -f docker-compose.prod.yml exec nginx nginx -s reload
+  #
+  # Certbot keeps its state under docker/letsencrypt (live/ + archive/, linked by symlinks - do NOT
+  # mount live/ alone or the links dangle) and copies the live pair into docker/nginx/certs, which
+  # is where nginx reads fullchain.pem / privkey.pem from. Back up docker/letsencrypt.
   certbot:
     image: certbot/certbot:latest
     profiles: ["tools"]
     volumes:
-      - ./docker/nginx/certs:/etc/letsencrypt/live/collab:rw
+      - ./docker/letsencrypt:/etc/letsencrypt
+      - ./docker/nginx/certs:/deploy:rw
       - certbot-webroot:/var/www/certbot
-    entrypoint: ["certbot"]
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >
+        certbot certonly --webroot -w /var/www/certbot -d "${APP_HOST:?set APP_HOST to the public hostname}"
+        --deploy-hook "cp -L /etc/letsencrypt/live/${APP_HOST:?set APP_HOST to the public hostname}/fullchain.pem /deploy/fullchain.pem
+        && cp -L /etc/letsencrypt/live/${APP_HOST:?set APP_HOST to the public hostname}/privkey.pem /deploy/privkey.pem"
+        && echo 'certificates deployed; reload nginx to pick them up'
 
 networks:
   edge: {}

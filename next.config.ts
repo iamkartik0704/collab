@@ -43,6 +43,12 @@ const nextConfig: NextConfig = {
   reactStrictMode: true,
   // BullMQ loads its Lua scripts from disk and must not be bundled.
   serverExternalPackages: ["bullmq", "ioredis", "pino", "razorpay", "@react-pdf/renderer"],
+  // pdfkit (pulled in by @react-pdf/renderer) loads its built-in font metrics through dynamic
+  // requires, which @vercel/nft cannot see: without this the standalone image ships without
+  // pdfkit/js/standard-fonts and every GST invoice / credit note render fails with MODULE_NOT_FOUND.
+  outputFileTracingIncludes: {
+    "/api/orders/**": ["./node_modules/pdfkit/js/**"],
+  },
   images: {
     formats: ["image/avif", "image/webp"],
     remotePatterns: [...storageRemotePatterns(), { protocol: "https", hostname: "lh3.googleusercontent.com", pathname: "/**" }],
